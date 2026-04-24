@@ -5,7 +5,8 @@ This roadmap is designed around one intentionally minimal application that evolv
 Core app for all stages: `Tiny Notes Lab`
 
 Principles:
-- Keep the application boring and minimal.
+
+- Keep the application minimal.
 - Add only enough app behavior to justify each new AWS service.
 - Prefer plain HTML, CSS, and vanilla JavaScript unless a stage truly requires more.
 - Favor free-tier-friendly choices where possible.
@@ -178,6 +179,7 @@ Move notes from browser storage into AWS-managed backend services.
 - Delete note
 
 Minimal data model:
+
 - `id`
 - `text`
 - `createdAt`
@@ -322,6 +324,7 @@ When a note is created, process extra derived data asynchronously.
 ### App Scope
 
 When a note is created:
+
 - Save it immediately
 - Queue background processing
 - Update note with fields like:
@@ -472,6 +475,7 @@ Run a simple daily maintenance job.
 ### App Scope
 
 Choose one:
+
 - Archive old notes
 - Delete temporary notes after a threshold
 
