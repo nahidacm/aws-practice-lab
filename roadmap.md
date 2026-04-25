@@ -273,11 +273,9 @@ New requirements:
 - Add authentication with Amazon Cognito
 - Users can sign up, sign in, and sign out
 - Each user should only access their own notes
-- Keep the UI minimal
 - Do not introduce large frontend frameworks
 - Store notes in DynamoDB with user scoping
 - API requests should require authentication
-- Keep implementation as small as possible for AWS learning
 
 Output:
 1. Updated frontend source code
