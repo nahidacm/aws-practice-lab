@@ -4,12 +4,12 @@ Stage 4 adds **Amazon Cognito** for authentication. Users sign in via the Cognit
 
 ## What changed from Stage 3
 
-| Layer | Change |
-|-------|--------|
-| Frontend | Sign in / sign out UI; `Authorization: Bearer <token>` on every API call |
-| Lambda | Reads `userId` from verified JWT claims; scopes all DynamoDB operations |
-| DynamoDB | Table recreated with composite key: `userId` (PK) + `id` (SK) |
-| API Gateway | JWT authorizer added; all routes now require a valid Cognito token |
+| Layer       | Change                                                                   |
+| ----------- | ------------------------------------------------------------------------ |
+| Frontend    | Sign in / sign out UI; `Authorization: Bearer <token>` on every API call |
+| Lambda      | Reads `userId` from verified JWT claims; scopes all DynamoDB operations  |
+| DynamoDB    | Table recreated with composite key: `userId` (PK) + `id` (SK)            |
+| API Gateway | JWT authorizer added; all routes now require a valid Cognito token       |
 
 ## Files
 
@@ -24,7 +24,7 @@ lambda/
 ## DynamoDB Table Schema
 
 | Attribute   | Type   | Role                          |
-|-------------|--------|-------------------------------|
+| ----------- | ------ | ----------------------------- |
 | `userId`    | String | Partition key — Cognito `sub` |
 | `id`        | String | Sort key — UUID v4            |
 | `text`      | String | Note content                  |
@@ -155,6 +155,7 @@ aws lambda update-function-code \
 The JWT authorizer sits in front of all routes. API Gateway validates the token signature and expiry before Lambda is ever called.
 
 > **Two different URLs to keep straight:**
+>
 > - `COGNITO_DOMAIN` in `app.js` — the Hosted UI: `https://tiny-notes-XXX.auth.us-east-1.amazoncognito.com`
 > - `Issuer` below — the Cognito service URL that appears in the JWT `iss` claim: `https://cognito-idp.REGION.amazonaws.com/POOL_ID`
 
@@ -185,7 +186,7 @@ done
 
 Any request without a valid Cognito token now gets a `401 Unauthorized` from API Gateway — Lambda is never invoked.
 
-**Also update the API's CORS configuration to allow the `Authorization` header.**
+**Update the API's CORS configuration to allow the `Authorization` header.**
 
 Stage 3 only listed `Content-Type`. Now that every request sends `Authorization: Bearer <token>`, the browser sends a CORS preflight `OPTIONS` request with `Access-Control-Request-Headers: authorization`. Without `Authorization` in `AllowHeaders`, the preflight fails and the browser blocks the call before it ever reaches the authorizer.
 
@@ -203,8 +204,9 @@ aws apigatewayv2 update-api \
 In `app.js`, set the two new constants:
 
 ```javascript
-const COGNITO_DOMAIN = 'https://tiny-notes-TIMESTAMP.auth.us-east-1.amazoncognito.com';
-const CLIENT_ID      = 'your-client-id-from-step-2';
+const COGNITO_DOMAIN =
+  "https://tiny-notes-TIMESTAMP.auth.us-east-1.amazoncognito.com";
+const CLIENT_ID = "your-client-id-from-step-2";
 ```
 
 `API_BASE` is already set from Stage 3.
