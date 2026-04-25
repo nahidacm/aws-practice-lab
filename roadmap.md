@@ -349,16 +349,14 @@ New requirements:
   - processedStatus
   - processedAt
 - Add a dead-letter queue
-- Keep the app behavior simple and educational
 - Frontend should show processing status
-- Keep code and infrastructure minimal
 
 Output:
 1. Updated frontend code
 2. Updated API Lambda code
 3. Worker Lambda code
 4. Queue and DLQ design notes
-5. Brief deployment guide
+5. AWS deployment guide
 6. Mermaid architecture diagram
 ```
 
