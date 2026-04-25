@@ -1,28 +1,36 @@
-# Tiny Notes Lab — Stage 3
+# Tiny Notes Lab — Stage 4
 
-Notes are now stored in **DynamoDB** and served through **API Gateway + Lambda**. The frontend is still plain HTML/CSS/JS — it just calls the API instead of localStorage.
+Stage 4 adds **Amazon Cognito** for authentication. Users sign in via the Cognito Hosted UI and each user only sees their own notes.
+
+## What changed from Stage 3
+
+| Layer | Change |
+|-------|--------|
+| Frontend | Sign in / sign out UI; `Authorization: Bearer <token>` on every API call |
+| Lambda | Reads `userId` from verified JWT claims; scopes all DynamoDB operations |
+| DynamoDB | Table recreated with composite key: `userId` (PK) + `id` (SK) |
+| API Gateway | JWT authorizer added; all routes now require a valid Cognito token |
 
 ## Files
 
 ```
 index.html
 style.css
-app.js                  ← update API_BASE before uploading
+app.js                  ← set COGNITO_DOMAIN and CLIENT_ID before deploying
 lambda/
-  handler.py            ← single Lambda function for all routes
+  handler.py
 ```
 
 ## DynamoDB Table Schema
 
-| Attribute   | Type   | Role          |
-|-------------|--------|---------------|
-| `id`        | String | Partition key — UUID v4 |
-| `text`      | String | Note content  |
-| `createdAt` | String | ISO 8601 UTC timestamp |
+| Attribute   | Type   | Role                          |
+|-------------|--------|-------------------------------|
+| `userId`    | String | Partition key — Cognito `sub` |
+| `id`        | String | Sort key — UUID v4            |
+| `text`      | String | Note content                  |
+| `createdAt` | String | ISO 8601 UTC timestamp        |
 
-- **Billing mode:** PAY_PER_REQUEST — no capacity to provision, stays in free tier for low traffic.
-- **No sort key** — notes are fetched with `scan()` and sorted by `createdAt` in Lambda. Fine for a small dataset; a real app would use a GSI.
-- One table, no user scoping yet (added in Stage 4 with Cognito).
+Using `userId` as the partition key means DynamoDB stores each user's notes together. Lambda uses `Query` (not `Scan`) to fetch only the calling user's notes efficiently.
 
 ---
 
@@ -30,47 +38,92 @@ lambda/
 
 ### Prerequisites
 
-- AWS CLI configured (`aws configure`)
-- An existing S3 bucket and CloudFront distribution from Stages 1–2
+- Existing S3 bucket, CloudFront distribution, API Gateway, and Lambda from Stages 1–3
+- AWS CLI configured
 
 ---
 
-### Step 1 — DynamoDB
+### Step 1 — Cognito User Pool
 
 ```bash
-aws dynamodb create-table \
-  --table-name tiny-notes \
-  --attribute-definitions AttributeName=id,AttributeType=S \
-  --key-schema AttributeName=id,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST \
-  --region us-east-1
+POOL_ID=$(aws cognito-idp create-user-pool \
+  --pool-name tiny-notes-pool \
+  --auto-verified-attributes email \
+  --username-attributes email \
+  --policies 'PasswordPolicy={MinimumLength=8,RequireUppercase=false,RequireLowercase=false,RequireNumbers=false,RequireSymbols=false}' \
+  --query 'UserPool.Id' --output text)
+
+echo "Pool ID: $POOL_ID"
 ```
 
 ---
 
-### Step 2 — IAM Role for Lambda
+### Step 2 — App Client
 
-Lambda needs permission to write CloudWatch Logs and access the DynamoDB table.
+The App Client is how the frontend talks to Cognito. No secret — browser apps can't keep secrets.
+
+Replace `YOUR_CLOUDFRONT_DOMAIN` with your CloudFront URL (e.g. `https://xxxx.cloudfront.net`).
 
 ```bash
-# Create the role
-aws iam create-role \
-  --role-name tiny-notes-lambda-role \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "lambda.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
+CLIENT_ID=$(aws cognito-idp create-user-pool-client \
+  --user-pool-id $POOL_ID \
+  --client-name tiny-notes-client \
+  --no-generate-secret \
+  --allowed-o-auth-flows implicit \
+  --allowed-o-auth-scopes openid email \
+  --allowed-o-auth-flows-user-pool-client \
+  --callback-urls '["https://YOUR_CLOUDFRONT_DOMAIN"]' \
+  --logout-urls  '["https://YOUR_CLOUDFRONT_DOMAIN"]' \
+  --supported-identity-providers COGNITO \
+  --query 'UserPoolClient.ClientId' --output text)
 
-# CloudWatch Logs (managed policy)
-aws iam attach-role-policy \
-  --role-name tiny-notes-lambda-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+echo "Client ID: $CLIENT_ID"
+```
 
-# DynamoDB access (inline policy — least-privilege)
+> **Callback URL must match exactly** what `REDIRECT_URI` resolves to in `app.js` (`window.location.origin`). Same for the logout URL.
+
+---
+
+### Step 3 — Hosted UI Domain
+
+The domain must be globally unique. Using a timestamp suffix is a simple way to ensure that.
+
+```bash
+DOMAIN_SUFFIX=$(date +%s)
+aws cognito-idp create-user-pool-domain \
+  --user-pool-id $POOL_ID \
+  --domain "tiny-notes-${DOMAIN_SUFFIX}"
+
+echo "COGNITO_DOMAIN: https://tiny-notes-${DOMAIN_SUFFIX}.auth.us-east-1.amazoncognito.com"
+```
+
+Copy the printed URL — you'll need it in `app.js`.
+
+---
+
+### Step 4 — Recreate DynamoDB Table
+
+The table schema changes in Stage 4 (composite key). Drop and recreate it.
+
+```bash
+aws dynamodb delete-table --table-name tiny-notes
+aws dynamodb wait table-not-exists --table-name tiny-notes
+
+aws dynamodb create-table \
+  --table-name tiny-notes \
+  --attribute-definitions \
+    AttributeName=userId,AttributeType=S \
+    AttributeName=id,AttributeType=S \
+  --key-schema \
+    AttributeName=userId,KeyType=HASH \
+    AttributeName=id,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+```
+
+Update the IAM policy to replace `dynamodb:Scan` with `dynamodb:Query`:
+
+```bash
 aws iam put-role-policy \
   --role-name tiny-notes-lambda-role \
   --policy-name TinyNotesDynamo \
@@ -78,38 +131,15 @@ aws iam put-role-policy \
     "Version": "2012-10-17",
     "Statement": [{
       "Effect": "Allow",
-      "Action": ["dynamodb:Scan", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Action": ["dynamodb:Query", "dynamodb:PutItem", "dynamodb:DeleteItem"],
       "Resource": "arn:aws:dynamodb:us-east-1:YOUR_ACCOUNT_ID:table/tiny-notes"
     }]
   }'
 ```
 
-> Find your account ID: `aws sts get-caller-identity --query Account --output text`
-
 ---
 
-### Step 3 — Lambda Function
-
-```bash
-cd lambda
-zip function.zip handler.py
-cd ..
-
-ROLE_ARN=$(aws iam get-role \
-  --role-name tiny-notes-lambda-role \
-  --query 'Role.Arn' --output text)
-
-aws lambda create-function \
-  --function-name tiny-notes \
-  --runtime python3.12 \
-  --handler handler.handler \
-  --role $ROLE_ARN \
-  --zip-file fileb://lambda/function.zip \
-  --environment Variables={TABLE_NAME=tiny-notes} \
-  --region us-east-1
-```
-
-**To redeploy Lambda code after changes:**
+### Step 5 — Update Lambda
 
 ```bash
 cd lambda && zip function.zip handler.py && cd ..
@@ -120,84 +150,68 @@ aws lambda update-function-code \
 
 ---
 
-### Step 4 — API Gateway (HTTP API)
+### Step 6 — API Gateway JWT Authorizer
 
-**Why HTTP API, not REST API?** HTTP API is simpler, cheaper, and supports CORS configuration at the API level — ideal here.
+The JWT authorizer sits in front of all routes. API Gateway validates the token signature and expiry before Lambda is ever called.
 
-**Why configure CORS at the API level?** The browser sends a preflight `OPTIONS` request before `POST` and `DELETE` calls. API Gateway intercepts these automatically when CORS is configured, so the Lambda never has to handle them.
+> **Two different URLs to keep straight:**
+> - `COGNITO_DOMAIN` in `app.js` — the Hosted UI: `https://tiny-notes-XXX.auth.us-east-1.amazoncognito.com`
+> - `Issuer` below — the Cognito service URL that appears in the JWT `iss` claim: `https://cognito-idp.REGION.amazonaws.com/POOL_ID`
 
 ```bash
-# Create the API with CORS enabled for all origins
-API_ID=$(aws apigatewayv2 create-api \
-  --name tiny-notes-api \
-  --protocol-type HTTP \
-  --cors-configuration 'AllowOrigins=["*"],AllowMethods=["GET","POST","DELETE"],AllowHeaders=["Content-Type"]' \
-  --query 'ApiId' --output text)
+API_ID=$(aws apigatewayv2 get-apis \
+  --query 'Items[?Name==`tiny-notes-api`].ApiId' --output text)
 
-# Get the Lambda ARN
-LAMBDA_ARN=$(aws lambda get-function \
-  --function-name tiny-notes \
-  --query 'Configuration.FunctionArn' --output text)
-
-# Create a single Lambda integration (all routes share it)
-INT_ID=$(aws apigatewayv2 create-integration \
+AUTH_ID=$(aws apigatewayv2 create-authorizer \
   --api-id $API_ID \
-  --integration-type AWS_PROXY \
-  --integration-uri $LAMBDA_ARN \
-  --payload-format-version 2.0 \
-  --query 'IntegrationId' --output text)
+  --authorizer-type JWT \
+  --identity-source '$request.header.Authorization' \
+  --name cognito-jwt \
+  --jwt-configuration \
+    Issuer="https://cognito-idp.us-east-1.amazonaws.com/${POOL_ID}",Audience="${CLIENT_ID}" \
+  --query 'AuthorizerId' --output text)
 
-# Create the three routes
-aws apigatewayv2 create-route --api-id $API_ID \
-  --route-key 'GET /notes'         --target "integrations/$INT_ID"
-
-aws apigatewayv2 create-route --api-id $API_ID \
-  --route-key 'POST /notes'        --target "integrations/$INT_ID"
-
-aws apigatewayv2 create-route --api-id $API_ID \
-  --route-key 'DELETE /notes/{id}' --target "integrations/$INT_ID"
-
-# Create $default stage with auto-deploy (no manual deploys needed)
-aws apigatewayv2 create-stage \
-  --api-id $API_ID \
-  --stage-name '$default' \
-  --auto-deploy
-
-# Grant API Gateway permission to invoke Lambda
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-aws lambda add-permission \
-  --function-name tiny-notes \
-  --statement-id apigw-invoke \
-  --action lambda:InvokeFunction \
-  --principal apigateway.amazonaws.com \
-  --source-arn "arn:aws:execute-api:us-east-1:${ACCOUNT_ID}:${API_ID}/*"
-
-# Print the base URL — copy this into app.js
-aws apigatewayv2 get-api --api-id $API_ID \
-  --query 'ApiEndpoint' --output text
+# Apply the authorizer to all three routes
+for ROUTE_KEY in 'GET /notes' 'POST /notes' 'DELETE /notes/{id}'; do
+  ROUTE_ID=$(aws apigatewayv2 get-routes --api-id $API_ID \
+    --query "Items[?RouteKey=='${ROUTE_KEY}'].RouteId" --output text)
+  aws apigatewayv2 update-route \
+    --api-id $API_ID \
+    --route-id $ROUTE_ID \
+    --authorization-type JWT \
+    --authorizer-id $AUTH_ID
+done
 ```
 
-The output looks like:
-```
-https://xxxxxxxxxxxx.execute-api.us-east-1.amazonaws.com
+Any request without a valid Cognito token now gets a `401 Unauthorized` from API Gateway — Lambda is never invoked.
+
+**Also update the API's CORS configuration to allow the `Authorization` header.**
+
+Stage 3 only listed `Content-Type`. Now that every request sends `Authorization: Bearer <token>`, the browser sends a CORS preflight `OPTIONS` request with `Access-Control-Request-Headers: authorization`. Without `Authorization` in `AllowHeaders`, the preflight fails and the browser blocks the call before it ever reaches the authorizer.
+
+```bash
+aws apigatewayv2 update-api \
+  --api-id $API_ID \
+  --cors-configuration \
+    'AllowOrigins=["*"],AllowMethods=["GET","POST","DELETE"],AllowHeaders=["Content-Type","Authorization"]'
 ```
 
 ---
 
-### Step 5 — Update the Frontend
+### Step 7 — Update the Frontend
 
-In `app.js`, replace:
+In `app.js`, set the two new constants:
 
 ```javascript
-const API_BASE = 'https://YOUR_API_ID.execute-api.us-east-1.amazonaws.com';
+const COGNITO_DOMAIN = 'https://tiny-notes-TIMESTAMP.auth.us-east-1.amazoncognito.com';
+const CLIENT_ID      = 'your-client-id-from-step-2';
 ```
 
-with the URL printed in Step 4.
+`API_BASE` is already set from Stage 3.
 
 ---
 
-### Step 6 — Upload to S3
+### Step 8 — Upload to S3 and Invalidate Cache
 
 ```bash
 aws s3 sync . s3://your-bucket-name \
@@ -205,16 +219,26 @@ aws s3 sync . s3://your-bucket-name \
   --include "index.html" \
   --include "style.css" \
   --include "app.js"
+
+aws cloudfront create-invalidation \
+  --distribution-id YOUR_DISTRIBUTION_ID \
+  --paths "/*"
 ```
 
 ---
 
-### Step 7 — Invalidate CloudFront Cache
+## How the Auth Flow Works
 
-```bash
-aws cloudfront create-invalidation \
-  --distribution-id YOUR_DISTRIBUTION_ID \
-  --paths "/*"
+```
+1. User clicks "Sign In / Sign Up"
+2. Browser redirects to Cognito Hosted UI
+3. User signs up or signs in
+4. Cognito redirects back to the app with id_token in the URL hash
+5. app.js stores the token in localStorage and clears it from the URL
+6. All API calls send: Authorization: Bearer <id_token>
+7. API Gateway validates the token against Cognito's JWKS endpoint
+8. Lambda reads userId from event.requestContext.authorizer.jwt.claims.sub
+9. DynamoDB Query scopes results to that userId
 ```
 
 ---
@@ -224,16 +248,17 @@ aws cloudfront create-invalidation \
 ```mermaid
 flowchart LR
     U[User Browser] -->|HTTPS| CF[CloudFront]
-    CF --> S3[S3 Static Site\nindex.html · style.css · app.js]
-    U -->|GET · POST · DELETE| APIGW[API Gateway\nHTTP API]
-    APIGW -->|proxy| L[Lambda\nhandler.py]
-    L -->|Scan · PutItem · DeleteItem| DDB[(DynamoDB\ntiny-notes)]
+    CF --> S3[S3 Static Site]
+    U -->|sign in / sign up| COG[Cognito\nHosted UI]
+    COG -->|id_token in URL hash| U
+    U -->|Bearer token| APIGW[API Gateway\n+ JWT Authorizer]
+    APIGW -->|validates token\nagainst Cognito JWKS| APIGW
+    APIGW -->|userId from claims| L[Lambda]
+    L -->|Query / PutItem / DeleteItem\nscoped to userId| DDB[(DynamoDB\ntiny-notes)]
 ```
-
-Notes are now stored in DynamoDB. The browser no longer uses localStorage. CloudFront still serves the static files; API Gateway is called directly from the browser.
 
 ---
 
-## What's Next — Stage 4
+## What's Next — Stage 5
 
-Add user authentication with **Amazon Cognito** so each user only sees their own notes.
+Add async background processing with **SQS**: when a note is created, queue a worker Lambda to enrich it with a derived field.

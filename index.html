@@ -10,13 +10,27 @@
   <main>
     <h1>Tiny Notes Lab</h1>
 
-    <form id="note-form">
-      <input id="note-input" type="text" placeholder="Write a note…" autocomplete="off" />
-      <button type="submit">Add</button>
-    </form>
+    <!-- shown when signed out -->
+    <section id="signed-out">
+      <p class="auth-msg">Sign in to save and access your notes.</p>
+      <button id="signin-btn" class="auth-btn">Sign In / Sign Up</button>
+    </section>
 
-    <p id="status" class="status"></p>
-    <ul id="note-list"></ul>
+    <!-- shown when signed in -->
+    <section id="signed-in" hidden>
+      <div id="auth-bar">
+        <span id="user-label"></span>
+        <button id="signout-btn">Sign Out</button>
+      </div>
+
+      <form id="note-form">
+        <input id="note-input" type="text" placeholder="Write a note…" autocomplete="off" />
+        <button type="submit">Add</button>
+      </form>
+
+      <p id="status" class="status"></p>
+      <ul id="note-list"></ul>
+    </section>
   </main>
 
   <script src="app.js"></script>
