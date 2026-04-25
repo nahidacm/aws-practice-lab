@@ -109,14 +109,16 @@ button:hover { background: #444; }
 
 #note-list li {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  gap: 0.5rem;
   background: #fff;
   border: 1px solid #e0e0e0;
   border-radius: 6px;
   padding: 0.6rem 0.75rem;
   font-size: 0.95rem;
 }
+
+.note-text { flex: 1; }
 
 .delete-btn {
   background: none;
@@ -127,3 +129,16 @@ button:hover { background: #444; }
 }
 
 .delete-btn:hover { background: none; color: #c00; }
+
+/* ── Processing badge ─────────────────────────────────────────────────────── */
+
+.badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.badge.done    { background: #e6f4ea; color: #1e7e34; }
+.badge.pending { background: #fff3e0; color: #e65100; }

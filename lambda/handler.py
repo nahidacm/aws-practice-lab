@@ -6,6 +6,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 
 table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+sqs   = boto3.client('sqs')
 
 HEADERS = {'Content-Type': 'application/json'}
 
@@ -13,8 +14,6 @@ def respond(status, body):
     return {'statusCode': status, 'headers': HEADERS, 'body': json.dumps(body)}
 
 def get_user_id(event):
-    # API Gateway JWT authorizer validates the token and injects claims.
-    # userId is the Cognito sub — stable, unique per user, never changes.
     return event['requestContext']['authorizer']['jwt']['claims']['sub']
 
 def handler(event, context):
@@ -32,17 +31,22 @@ def handler(event, context):
         if not text:
             return respond(400, {'error': 'text is required'})
         note = {
-            'userId':    uid,
-            'id':        str(uuid.uuid4()),
-            'text':      text,
-            'createdAt': datetime.now(timezone.utc).isoformat(),
+            'userId':          uid,
+            'id':              str(uuid.uuid4()),
+            'text':            text,
+            'createdAt':       datetime.now(timezone.utc).isoformat(),
+            'processedStatus': 'pending',
         }
         table.put_item(Item=note)
+        # Enqueue for async processing — worker fills in summary, processedStatus, processedAt
+        sqs.send_message(
+            QueueUrl=os.environ['QUEUE_URL'],
+            MessageBody=json.dumps({'userId': uid, 'id': note['id'], 'text': text}),
+        )
         return respond(201, note)
 
     if route == 'DELETE /notes/{id}':
         note_id = (event.get('pathParameters') or {}).get('id', '')
-        # userId comes from the verified token — users can only delete their own notes.
         table.delete_item(Key={'userId': uid, 'id': note_id})
         return respond(200, {'deleted': note_id})
 

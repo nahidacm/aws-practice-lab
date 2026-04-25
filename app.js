@@ -56,7 +56,8 @@ const input = document.getElementById('note-input');
 const list = document.getElementById('note-list');
 const statusEl = document.getElementById('status');
 
-let busy = false;
+let busy          = false;
+let refreshTimer  = null;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -68,10 +69,15 @@ function escapeHtml(str) {
 
 function renderNotes(notes) {
   list.innerHTML = '';
-  notes.forEach(({ id, text }) => {
+  notes.forEach(note => {
+    const { id, text, processedStatus, summary } = note;
+    const badge = processedStatus === 'done'
+      ? `<span class="badge done">${escapeHtml(summary || 'done')}</span>`
+      : `<span class="badge pending">processing…</span>`;
     const li = document.createElement('li');
     li.innerHTML = `
-      <span>${escapeHtml(text)}</span>
+      <span class="note-text">${escapeHtml(text)}</span>
+      ${badge}
       <button class="delete-btn" data-id="${id}" aria-label="Delete note">✕</button>
     `;
     list.appendChild(li);
@@ -95,10 +101,16 @@ function authFetch(url, opts = {}) {
 async function loadNotes() {
   setStatus('Loading…');
   try {
-    const res = await authFetch(`${API_BASE}/notes`);
+    const res   = await authFetch(`${API_BASE}/notes`);
     if (res.status === 401 || res.status === 403) { signOut(); return; }
-    renderNotes(await res.json());
+    const notes = await res.json();
+    renderNotes(notes);
     setStatus('');
+    // Keep polling until every note has been processed by the worker.
+    clearTimeout(refreshTimer);
+    if (notes.some(n => n.processedStatus !== 'done')) {
+      refreshTimer = setTimeout(loadNotes, 3000);
+    }
   } catch { setStatus('Could not load notes — check the console.'); }
 }
 

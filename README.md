@@ -1,219 +1,227 @@
-# Tiny Notes Lab — Stage 4
+# Tiny Notes Lab — Stage 5
 
-Stage 4 adds **Amazon Cognito** for authentication. Users sign in via the Cognito Hosted UI and each user only sees their own notes.
+Stage 5 adds **async processing with SQS**. When a note is created the API returns immediately; a separate worker Lambda picks up the message and enriches the note in the background.
 
-## What changed from Stage 3
+## What changed from Stage 4
 
-| Layer       | Change                                                                   |
-| ----------- | ------------------------------------------------------------------------ |
-| Frontend    | Sign in / sign out UI; `Authorization: Bearer <token>` on every API call |
-| Lambda      | Reads `userId` from verified JWT claims; scopes all DynamoDB operations  |
-| DynamoDB    | Table recreated with composite key: `userId` (PK) + `id` (SK)            |
-| API Gateway | JWT authorizer added; all routes now require a valid Cognito token       |
+| Layer    | Change |
+|----------|--------|
+| Frontend | `processedStatus` badge on each note; auto-polls every 3 s while any note is `pending` |
+| API Lambda | Stamps new notes with `processedStatus: pending`; publishes `{userId, id, text}` to SQS |
+| Worker Lambda | New — triggered by SQS; computes `summary` (word count), writes `done` status back to DynamoDB |
+| Infrastructure | SQS standard queue + dead-letter queue (DLQ) |
 
 ## Files
 
 ```
 index.html
 style.css
-app.js                  ← set COGNITO_DOMAIN and CLIENT_ID before deploying
+app.js
 lambda/
-  handler.py
+  handler.py    ← API Lambda (updated)
+  worker.py     ← Worker Lambda (new)
 ```
 
-## DynamoDB Table Schema
+## Queue Design
 
-| Attribute   | Type   | Role                          |
-| ----------- | ------ | ----------------------------- |
-| `userId`    | String | Partition key — Cognito `sub` |
-| `id`        | String | Sort key — UUID v4            |
-| `text`      | String | Note content                  |
-| `createdAt` | String | ISO 8601 UTC timestamp        |
+### Main queue — `tiny-notes-processing`
 
-Using `userId` as the partition key means DynamoDB stores each user's notes together. Lambda uses `Query` (not `Scan`) to fetch only the calling user's notes efficiently.
+| Setting | Value | Why |
+|---------|-------|-----|
+| Type | Standard | Order doesn't matter; at-least-once delivery is fine |
+| Visibility timeout | 30 s | Must be ≥ Lambda timeout so in-flight messages stay hidden during processing |
+| Message retention | 4 days | Default; messages older than this are dropped |
+| Max receive count | 3 | After 3 failed attempts the message moves to the DLQ |
+
+### Dead-letter queue — `tiny-notes-processing-dlq`
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| Type | Standard | Same as source queue |
+| Message retention | 14 days | Longer retention gives time to inspect and replay failures |
+
+**Message format** — the API Lambda sends:
+```json
+{ "userId": "cognito-sub", "id": "uuid", "text": "note content" }
+```
+
+The text is included in the message so the worker is self-contained and needs no DynamoDB read permission.
+
+**Failure behaviour** — if `worker.handler` raises an uncaught exception, Lambda does not delete the message. SQS makes it visible again after the visibility timeout. After 3 attempts (`maxReceiveCount`) the message is moved to the DLQ automatically.
 
 ---
 
 ## AWS Deployment
 
 ### Prerequisites
-
-- Existing S3 bucket, CloudFront distribution, API Gateway, and Lambda from Stages 1–3
+- Existing setup from Stages 1–4 (S3, CloudFront, Cognito, API Gateway, API Lambda, DynamoDB)
 - AWS CLI configured
 
 ---
 
-### Step 1 — Cognito User Pool
+### Step 1 — Create the DLQ
 
 ```bash
-POOL_ID=$(aws cognito-idp create-user-pool \
-  --pool-name tiny-notes-pool \
-  --auto-verified-attributes email \
-  --username-attributes email \
-  --policies 'PasswordPolicy={MinimumLength=8,RequireUppercase=false,RequireLowercase=false,RequireNumbers=false,RequireSymbols=false}' \
-  --query 'UserPool.Id' --output text)
+DLQ_URL=$(aws sqs create-queue \
+  --queue-name tiny-notes-processing-dlq \
+  --attributes MessageRetentionPeriod=1209600 \
+  --query 'QueueUrl' --output text)
 
-echo "Pool ID: $POOL_ID"
+DLQ_ARN=$(aws sqs get-queue-attributes \
+  --queue-url $DLQ_URL \
+  --attribute-names QueueArn \
+  --query 'Attributes.QueueArn' --output text)
+
+echo "DLQ ARN: $DLQ_ARN"
 ```
 
 ---
 
-### Step 2 — App Client
-
-The App Client is how the frontend talks to Cognito. No secret — browser apps can't keep secrets.
-
-Replace `YOUR_CLOUDFRONT_DOMAIN` with your CloudFront URL (e.g. `https://xxxx.cloudfront.net`).
+### Step 2 — Create the Main Queue
 
 ```bash
-CLIENT_ID=$(aws cognito-idp create-user-pool-client \
-  --user-pool-id $POOL_ID \
-  --client-name tiny-notes-client \
-  --no-generate-secret \
-  --allowed-o-auth-flows implicit \
-  --allowed-o-auth-scopes openid email \
-  --allowed-o-auth-flows-user-pool-client \
-  --callback-urls '["https://YOUR_CLOUDFRONT_DOMAIN"]' \
-  --logout-urls  '["https://YOUR_CLOUDFRONT_DOMAIN"]' \
-  --supported-identity-providers COGNITO \
-  --query 'UserPoolClient.ClientId' --output text)
+REDRIVE=$(printf '{"deadLetterTargetArn":"%s","maxReceiveCount":"3"}' "$DLQ_ARN")
 
-echo "Client ID: $CLIENT_ID"
+QUEUE_URL=$(aws sqs create-queue \
+  --queue-name tiny-notes-processing \
+  --attributes \
+    VisibilityTimeout=30 \
+    "RedrivePolicy=${REDRIVE}" \
+  --query 'QueueUrl' --output text)
+
+QUEUE_ARN=$(aws sqs get-queue-attributes \
+  --queue-url $QUEUE_URL \
+  --attribute-names QueueArn \
+  --query 'Attributes.QueueArn' --output text)
+
+echo "Queue URL: $QUEUE_URL"
 ```
-
-> **Callback URL must match exactly** what `REDIRECT_URI` resolves to in `app.js` (`window.location.origin`). Same for the logout URL.
 
 ---
 
-### Step 3 — Hosted UI Domain
-
-The domain must be globally unique. Using a timestamp suffix is a simple way to ensure that.
-
-```bash
-DOMAIN_SUFFIX=$(date +%s)
-aws cognito-idp create-user-pool-domain \
-  --user-pool-id $POOL_ID \
-  --domain "tiny-notes-${DOMAIN_SUFFIX}"
-
-echo "COGNITO_DOMAIN: https://tiny-notes-${DOMAIN_SUFFIX}.auth.us-east-1.amazoncognito.com"
-```
-
-Copy the printed URL — you'll need it in `app.js`.
-
----
-
-### Step 4 — Recreate DynamoDB Table
-
-The table schema changes in Stage 4 (composite key). Drop and recreate it.
-
-```bash
-aws dynamodb delete-table --table-name tiny-notes
-aws dynamodb wait table-not-exists --table-name tiny-notes
-
-aws dynamodb create-table \
-  --table-name tiny-notes \
-  --attribute-definitions \
-    AttributeName=userId,AttributeType=S \
-    AttributeName=id,AttributeType=S \
-  --key-schema \
-    AttributeName=userId,KeyType=HASH \
-    AttributeName=id,KeyType=RANGE \
-  --billing-mode PAY_PER_REQUEST \
-  --region us-east-1
-```
-
-Update the IAM policy to replace `dynamodb:Scan` with `dynamodb:Query`:
+### Step 3 — Grant the API Lambda Permission to Send Messages
 
 ```bash
 aws iam put-role-policy \
   --role-name tiny-notes-lambda-role \
-  --policy-name TinyNotesDynamo \
+  --policy-name TinyNotesSQSSend \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [{
+      \"Effect\": \"Allow\",
+      \"Action\": [\"sqs:SendMessage\"],
+      \"Resource\": \"${QUEUE_ARN}\"
+    }]
+  }"
+```
+
+---
+
+### Step 4 — Update the API Lambda
+
+Add the `QUEUE_URL` environment variable and deploy the updated code.
+
+```bash
+aws lambda update-function-configuration \
+  --function-name tiny-notes \
+  --environment "Variables={TABLE_NAME=tiny-notes,QUEUE_URL=${QUEUE_URL}}"
+
+cd lambda && zip api.zip handler.py && cd ..
+aws lambda update-function-code \
+  --function-name tiny-notes \
+  --zip-file fileb://lambda/api.zip
+```
+
+---
+
+### Step 5 — Create the Worker Lambda
+
+**IAM role for the worker:**
+
+```bash
+aws iam create-role \
+  --role-name tiny-notes-worker-role \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "lambda.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+# CloudWatch Logs
+aws iam attach-role-policy \
+  --role-name tiny-notes-worker-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# SQS receive + delete (required for event source mapping)
+aws iam attach-role-policy \
+  --role-name tiny-notes-worker-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+
+# DynamoDB UpdateItem
+aws iam put-role-policy \
+  --role-name tiny-notes-worker-role \
+  --policy-name TinyNotesWorkerDynamo \
   --policy-document '{
     "Version": "2012-10-17",
     "Statement": [{
       "Effect": "Allow",
-      "Action": ["dynamodb:Query", "dynamodb:PutItem", "dynamodb:DeleteItem"],
+      "Action": ["dynamodb:UpdateItem"],
       "Resource": "arn:aws:dynamodb:us-east-1:YOUR_ACCOUNT_ID:table/tiny-notes"
     }]
   }'
 ```
 
----
-
-### Step 5 — Update Lambda
+**Create the Lambda function:**
 
 ```bash
-cd lambda && zip function.zip handler.py && cd ..
+WORKER_ROLE_ARN=$(aws iam get-role \
+  --role-name tiny-notes-worker-role \
+  --query 'Role.Arn' --output text)
+
+cd lambda && zip worker.zip worker.py && cd ..
+
+aws lambda create-function \
+  --function-name tiny-notes-worker \
+  --runtime python3.12 \
+  --handler worker.handler \
+  --role $WORKER_ROLE_ARN \
+  --zip-file fileb://lambda/worker.zip \
+  --environment Variables={TABLE_NAME=tiny-notes} \
+  --timeout 30 \
+  --region us-east-1
+```
+
+> The worker timeout (30 s) must be ≤ the queue's visibility timeout (30 s). If the Lambda runs longer than the visibility timeout, SQS makes the message visible again before the Lambda finishes — causing duplicate processing.
+
+---
+
+### Step 6 — Connect SQS to the Worker Lambda
+
+```bash
+aws lambda create-event-source-mapping \
+  --function-name tiny-notes-worker \
+  --event-source-arn $QUEUE_ARN \
+  --batch-size 10 \
+  --maximum-batching-window-in-seconds 5
+```
+
+Lambda will now poll the queue automatically. No API Gateway route is needed — SQS invokes the worker directly.
+
+**To update the worker code later:**
+
+```bash
+cd lambda && zip worker.zip worker.py && cd ..
 aws lambda update-function-code \
-  --function-name tiny-notes \
-  --zip-file fileb://lambda/function.zip
+  --function-name tiny-notes-worker \
+  --zip-file fileb://lambda/worker.zip
 ```
 
 ---
 
-### Step 6 — API Gateway JWT Authorizer
-
-The JWT authorizer sits in front of all routes. API Gateway validates the token signature and expiry before Lambda is ever called.
-
-> **Two different URLs to keep straight:**
->
-> - `COGNITO_DOMAIN` in `app.js` — the Hosted UI: `https://tiny-notes-XXX.auth.us-east-1.amazoncognito.com`
-> - `Issuer` below — the Cognito service URL that appears in the JWT `iss` claim: `https://cognito-idp.REGION.amazonaws.com/POOL_ID`
-
-```bash
-API_ID=$(aws apigatewayv2 get-apis \
-  --query 'Items[?Name==`tiny-notes-api`].ApiId' --output text)
-
-AUTH_ID=$(aws apigatewayv2 create-authorizer \
-  --api-id $API_ID \
-  --authorizer-type JWT \
-  --identity-source '$request.header.Authorization' \
-  --name cognito-jwt \
-  --jwt-configuration \
-    Issuer="https://cognito-idp.us-east-1.amazonaws.com/${POOL_ID}",Audience="${CLIENT_ID}" \
-  --query 'AuthorizerId' --output text)
-
-# Apply the authorizer to all three routes
-for ROUTE_KEY in 'GET /notes' 'POST /notes' 'DELETE /notes/{id}'; do
-  ROUTE_ID=$(aws apigatewayv2 get-routes --api-id $API_ID \
-    --query "Items[?RouteKey=='${ROUTE_KEY}'].RouteId" --output text)
-  aws apigatewayv2 update-route \
-    --api-id $API_ID \
-    --route-id $ROUTE_ID \
-    --authorization-type JWT \
-    --authorizer-id $AUTH_ID
-done
-```
-
-Any request without a valid Cognito token now gets a `401 Unauthorized` from API Gateway — Lambda is never invoked.
-
-**Update the API's CORS configuration to allow the `Authorization` header.**
-
-Stage 3 only listed `Content-Type`. Now that every request sends `Authorization: Bearer <token>`, the browser sends a CORS preflight `OPTIONS` request with `Access-Control-Request-Headers: authorization`. Without `Authorization` in `AllowHeaders`, the preflight fails and the browser blocks the call before it ever reaches the authorizer.
-
-```bash
-aws apigatewayv2 update-api \
-  --api-id $API_ID \
-  --cors-configuration \
-    'AllowOrigins=["*"],AllowMethods=["GET","POST","DELETE"],AllowHeaders=["Content-Type","Authorization"]'
-```
-
----
-
-### Step 7 — Update the Frontend
-
-In `app.js`, set the two new constants:
-
-```javascript
-const COGNITO_DOMAIN =
-  "https://tiny-notes-TIMESTAMP.auth.us-east-1.amazoncognito.com";
-const CLIENT_ID = "your-client-id-from-step-2";
-```
-
-`API_BASE` is already set from Stage 3.
-
----
-
-### Step 8 — Upload to S3 and Invalidate Cache
+### Step 7 — Upload Frontend and Invalidate Cache
 
 ```bash
 aws s3 sync . s3://your-bucket-name \
@@ -229,38 +237,23 @@ aws cloudfront create-invalidation \
 
 ---
 
-## How the Auth Flow Works
-
-```
-1. User clicks "Sign In / Sign Up"
-2. Browser redirects to Cognito Hosted UI
-3. User signs up or signs in
-4. Cognito redirects back to the app with id_token in the URL hash
-5. app.js stores the token in localStorage and clears it from the URL
-6. All API calls send: Authorization: Bearer <id_token>
-7. API Gateway validates the token against Cognito's JWKS endpoint
-8. Lambda reads userId from event.requestContext.authorizer.jwt.claims.sub
-9. DynamoDB Query scopes results to that userId
-```
-
----
-
 ## Architecture
 
 ```mermaid
 flowchart LR
     U[User Browser] -->|HTTPS| CF[CloudFront]
     CF --> S3[S3 Static Site]
-    U -->|sign in / sign up| COG[Cognito\nHosted UI]
-    COG -->|id_token in URL hash| U
     U -->|Bearer token| APIGW[API Gateway\n+ JWT Authorizer]
-    APIGW -->|validates token\nagainst Cognito JWKS| APIGW
-    APIGW -->|userId from claims| L[Lambda]
-    L -->|Query / PutItem / DeleteItem\nscoped to userId| DDB[(DynamoDB\ntiny-notes)]
+    APIGW --> API[API Lambda\nhandler.py]
+    API -->|PutItem\nstatus=pending| DDB[(DynamoDB\ntiny-notes)]
+    API -->|SendMessage\nuserid+id+text| Q[SQS Queue\ntiny-notes-processing]
+    Q -->|triggers| W[Worker Lambda\nworker.py]
+    W -->|UpdateItem\nsummary+status=done| DDB
+    Q -->|after 3 failures| DLQ[Dead-Letter Queue\ntiny-notes-processing-dlq]
 ```
 
 ---
 
-## What's Next — Stage 5
+## What's Next — Stage 6
 
-Add async background processing with **SQS**: when a note is created, queue a worker Lambda to enrich it with a derived field.
+Allow users to attach a file to a note using **S3 presigned upload URLs**.
