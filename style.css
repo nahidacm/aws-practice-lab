@@ -145,9 +145,9 @@ button:hover { background: #444; }
 
 /* ── Attachments ─────────────────────────────────────────────────────────── */
 
-.file-input { display: none; }
-
 .attach-btn {
+  background: none;
+  border: none;
   color: #bbb;
   font-size: 1rem;
   cursor: pointer;
@@ -156,6 +156,8 @@ button:hover { background: #444; }
   line-height: 1;
   user-select: none;
 }
+
+#file-input { display: none; }
 
 .attach-btn:hover { color: #555; }
 

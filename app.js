@@ -80,8 +80,7 @@ function renderNotes(notes) {
     const attachment = attachmentKey
       ? `<a class="attach-link" href="${escapeHtml(attachmentUrl)}" target="_blank"
             rel="noopener" title="${escapeHtml(filename)}">📎 ${escapeHtml(filename)}</a>`
-      : `<label class="attach-btn" title="Attach a file"
-              >📎<input type="file" class="file-input" data-note-id="${id}"></label>`;
+      : `<button class="attach-btn" data-note-id="${id}" title="Attach a file">📎</button>`;
 
     const li = document.createElement('li');
     li.innerHTML = `
@@ -141,24 +140,31 @@ form.addEventListener('submit', async e => {
   finally { busy = false; }
 });
 
-// File selected — upload directly to S3 via presigned URL, then refresh.
-list.addEventListener('change', async e => {
-  console.log('File input changed', e.target);
-  const fileInput = e.target.closest('.file-input');
-  if (!fileInput || !fileInput.files[0]) return;
-  const file = fileInput.files[0];
+// ── File upload ───────────────────────────────────────────────────────────────
+// A single persistent <input type="file"> in the HTML is clicked programmatically
+// by the per-note attach buttons. This avoids relying on change-event delegation
+// from dynamically created inputs, which silently breaks when renderNotes() reruns
+// (e.g. the 3 s auto-refresh) while the OS file picker is still open — the original
+// input is detached from the DOM and its change event never reaches the listener.
+
+const fileInput = document.getElementById('file-input');
+
+fileInput.addEventListener('change', async () => {
+  if (!fileInput.files[0]) return;
+  const file   = fileInput.files[0];
   const noteId = fileInput.dataset.noteId;
+  fileInput.value = ''; // reset so the same file can be re-selected next time
 
   setStatus('Uploading…');
   try {
-    // Step 1: ask the API for a presigned PUT URL.
+    // Step 1: get a presigned PUT URL from the API.
     const res = await authFetch(`${API_BASE}/notes/${noteId}/upload-url`, {
       method: 'POST',
       body: JSON.stringify({ filename: file.name, contentType: file.type || 'application/octet-stream' }),
     });
     const { uploadUrl } = await res.json();
 
-    // Step 2: PUT the file straight to S3.
+    // Step 2: PUT directly to S3.
     // No Authorization header — the presigned URL already embeds credentials.
     const s3Res = await fetch(uploadUrl, {
       method: 'PUT',
@@ -175,6 +181,14 @@ list.addEventListener('change', async e => {
 });
 
 list.addEventListener('click', async e => {
+  // Attach button — stamp the note ID onto the shared input, then open the picker.
+  const attachBtn = e.target.closest('.attach-btn');
+  if (attachBtn) {
+    fileInput.dataset.noteId = attachBtn.dataset.noteId;
+    fileInput.click();
+    return;
+  }
+
   const btn = e.target.closest('.delete-btn');
   if (!btn || busy) return;
   busy = true; setStatus('Deleting…');
