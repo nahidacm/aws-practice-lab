@@ -423,14 +423,13 @@ New requirements:
   - choosing a file
   - uploading directly to S3 with a presigned URL
   - showing attachment link after upload
-- Keep UI and code minimal
 - Keep the purpose focused on AWS integration
 
 Output:
 1. Updated frontend source code
 2. Updated backend code for presigned URL generation
 3. Suggested S3 bucket structure
-4. Brief deployment guide
+4. AWS deployment guide
 5. Mermaid architecture diagram
 ```
 

@@ -142,3 +142,33 @@ button:hover { background: #444; }
 
 .badge.done    { background: #e6f4ea; color: #1e7e34; }
 .badge.pending { background: #fff3e0; color: #e65100; }
+
+/* ── Attachments ─────────────────────────────────────────────────────────── */
+
+.file-input { display: none; }
+
+.attach-btn {
+  color: #bbb;
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0 0.15rem;
+  flex-shrink: 0;
+  line-height: 1;
+  user-select: none;
+}
+
+.attach-btn:hover { color: #555; }
+
+.attach-link {
+  font-size: 0.78rem;
+  color: #1a73e8;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100px;
+  flex-shrink: 0;
+  display: inline-block;
+}
+
+.attach-link:hover { text-decoration: underline; }

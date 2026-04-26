@@ -56,8 +56,8 @@ const input = document.getElementById('note-input');
 const list = document.getElementById('note-list');
 const statusEl = document.getElementById('status');
 
-let busy          = false;
-let refreshTimer  = null;
+let busy = false;
+let refreshTimer = null;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -70,14 +70,24 @@ function escapeHtml(str) {
 function renderNotes(notes) {
   list.innerHTML = '';
   notes.forEach(note => {
-    const { id, text, processedStatus, summary } = note;
+    const { id, text, processedStatus, summary, attachmentKey, attachmentUrl } = note;
+
     const badge = processedStatus === 'done'
       ? `<span class="badge done">${escapeHtml(summary || 'done')}</span>`
       : `<span class="badge pending">processing…</span>`;
+
+    const filename = attachmentKey ? attachmentKey.split('/').pop() : '';
+    const attachment = attachmentKey
+      ? `<a class="attach-link" href="${escapeHtml(attachmentUrl)}" target="_blank"
+            rel="noopener" title="${escapeHtml(filename)}">📎 ${escapeHtml(filename)}</a>`
+      : `<label class="attach-btn" title="Attach a file"
+              >📎<input type="file" class="file-input" data-note-id="${id}"></label>`;
+
     const li = document.createElement('li');
     li.innerHTML = `
       <span class="note-text">${escapeHtml(text)}</span>
       ${badge}
+      ${attachment}
       <button class="delete-btn" data-id="${id}" aria-label="Delete note">✕</button>
     `;
     list.appendChild(li);
@@ -101,7 +111,7 @@ function authFetch(url, opts = {}) {
 async function loadNotes() {
   setStatus('Loading…');
   try {
-    const res   = await authFetch(`${API_BASE}/notes`);
+    const res = await authFetch(`${API_BASE}/notes`);
     if (res.status === 401 || res.status === 403) { signOut(); return; }
     const notes = await res.json();
     renderNotes(notes);
@@ -129,6 +139,39 @@ form.addEventListener('submit', async e => {
     await loadNotes();
   } catch { setStatus('Failed to save note.'); }
   finally { busy = false; }
+});
+
+// File selected — upload directly to S3 via presigned URL, then refresh.
+list.addEventListener('change', async e => {
+  console.log('File input changed', e.target);
+  const fileInput = e.target.closest('.file-input');
+  if (!fileInput || !fileInput.files[0]) return;
+  const file = fileInput.files[0];
+  const noteId = fileInput.dataset.noteId;
+
+  setStatus('Uploading…');
+  try {
+    // Step 1: ask the API for a presigned PUT URL.
+    const res = await authFetch(`${API_BASE}/notes/${noteId}/upload-url`, {
+      method: 'POST',
+      body: JSON.stringify({ filename: file.name, contentType: file.type || 'application/octet-stream' }),
+    });
+    const { uploadUrl } = await res.json();
+
+    // Step 2: PUT the file straight to S3.
+    // No Authorization header — the presigned URL already embeds credentials.
+    const s3Res = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    if (!s3Res.ok) throw new Error(`S3 PUT ${s3Res.status}`);
+
+    await loadNotes();
+  } catch (err) {
+    setStatus('Upload failed — check the console.');
+    console.error(err);
+  }
 });
 
 list.addEventListener('click', async e => {
