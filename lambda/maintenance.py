@@ -7,8 +7,12 @@ from boto3.dynamodb.conditions import Attr
 table              = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
 ARCHIVE_AFTER_DAYS = int(os.environ.get('ARCHIVE_AFTER_DAYS', '30'))
 
+def log(level, **kwargs):
+    print(json.dumps({'level': level, **kwargs}))
+
 def handler(event, context):
     cutoff = (datetime.now(timezone.utc) - timedelta(days=ARCHIVE_AFTER_DAYS)).isoformat()
+    log('INFO', action='maintenance_started', cutoff=cutoff, archiveAfterDays=ARCHIVE_AFTER_DAYS)
 
     # Scan is acceptable: this runs once per day, not on user requests.
     # Attr('archived').not_exists() is required — DynamoDB evaluates a missing
@@ -29,5 +33,5 @@ def handler(event, context):
         )
 
     summary = {'archived': len(items), 'cutoff': cutoff}
-    print(json.dumps(summary))
+    log('INFO', action='maintenance_complete', **summary)
     return summary

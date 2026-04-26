@@ -12,6 +12,9 @@ s3     = boto3.client('s3')
 BUCKET  = os.environ['ATTACHMENT_BUCKET']
 HEADERS = {'Content-Type': 'application/json'}
 
+def log(level, **kwargs):
+    print(json.dumps({'level': level, **kwargs}))
+
 def respond(status, body):
     return {'statusCode': status, 'headers': HEADERS, 'body': json.dumps(body)}
 
@@ -52,6 +55,7 @@ def handler(event, context):
             QueueUrl=os.environ['QUEUE_URL'],
             MessageBody=json.dumps({'userId': uid, 'id': note['id'], 'text': text}),
         )
+        log('INFO', action='note_created', noteId=note['id'])
         return respond(201, note)
 
     if route == 'POST /notes/{id}/upload-url':
@@ -75,6 +79,7 @@ def handler(event, context):
             UpdateExpression='SET attachmentKey = :k',
             ExpressionAttributeValues={':k': key},
         )
+        log('INFO', action='upload_url_generated', noteId=note_id, filename=filename)
         return respond(200, {'uploadUrl': upload_url, 'key': key})
 
     if route == 'DELETE /notes/{id}':
@@ -84,9 +89,10 @@ def handler(event, context):
             item = table.get_item(Key={'userId': uid, 'id': note_id}).get('Item', {})
             if item.get('attachmentKey'):
                 s3.delete_object(Bucket=BUCKET, Key=item['attachmentKey'])
-        except Exception:
-            pass
+        except Exception as e:
+            log('WARN', action='s3_cleanup_failed', noteId=note_id, error=str(e))
         table.delete_item(Key={'userId': uid, 'id': note_id})
+        log('INFO', action='note_deleted', noteId=note_id)
         return respond(200, {'deleted': note_id})
 
     return respond(404, {'error': 'not found'})

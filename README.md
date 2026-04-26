@@ -1,201 +1,287 @@
-# Tiny Notes Lab — Stage 7
+# Tiny Notes Lab — Stage 8
 
-Stage 7 adds **scheduled automation with EventBridge**. A maintenance Lambda runs once per day and archives notes older than a configurable number of days.
+Stage 8 adds **CloudWatch observability**: structured logging across all Lambdas, alarms for the three most important failure signals, a dashboard, and Log Insights queries for investigation.
 
-## What changed from Stage 6
+## What changed from Stage 7
 
-| Layer              | Change                                                                    |
-| ------------------ | ------------------------------------------------------------------------- |
-| Frontend           | Grey "archived" badge + struck-through text for archived notes            |
-| Maintenance Lambda | New — triggered by EventBridge; scans DynamoDB and sets `archived = true` |
-| Infrastructure     | EventBridge scheduled rule + Lambda invocation permission                 |
+| Layer | Change |
+|-------|--------|
+| All three Lambdas | Shared `log()` helper; JSON log lines on every key action and error |
+| Worker Lambda | `try/except` per SQS record — errors are logged before re-raising so the DLQ alarm fires rather than silently swallowing failures |
+| Infrastructure | SNS alert topic · 4 CloudWatch alarms · 1 dashboard · 1 log metric filter |
 
 ## Files
 
 ```
-index.html
-style.css               ← archived badge style added
-app.js                  ← archived indicator in renderNotes
 lambda/
-  handler.py            ← unchanged
-  worker.py             ← unchanged
-  maintenance.py        ← new scheduled Lambda
+  handler.py      ← log() added; note_created, note_deleted, upload_url_generated, s3_cleanup_failed
+  worker.py       ← log() added; note_processed, processing_failed; try/except per record
+  maintenance.py  ← log() added; maintenance_started, maintenance_complete
 ```
 
-## How It Works
+---
 
+## Structured Logging Pattern
+
+Every Lambda now contains:
+
+```python
+def log(level, **kwargs):
+    print(json.dumps({'level': level, **kwargs}))
 ```
-EventBridge rule fires at 2:00 AM UTC every day
-  └─▶ maintenance.py Lambda invoked with empty payload {}
-        └─▶ DynamoDB Scan: createdAt < (now - ARCHIVE_AFTER_DAYS)
-                             AND (archived not exists OR archived = false)
-              └─▶ UpdateItem: SET archived = true  (for each matching note)
+
+`print()` in Lambda writes to CloudWatch Logs. JSON lines are directly queryable with Log Insights. Every call site documents itself:
+
+```python
+log('INFO',  action='note_created',        noteId=note['id'])
+log('INFO',  action='note_processed',      noteId=note_id, summary=summary)
+log('WARN',  action='s3_cleanup_failed',   noteId=note_id, error=str(e))
+log('ERROR', action='processing_failed',   noteId=note_id, error=str(e))
+log('INFO',  action='maintenance_complete', archived=2, cutoff='2026-...')
 ```
 
-`ARCHIVE_AFTER_DAYS` defaults to `30`. Change it via the Lambda environment variable without redeploying code.
+**Why not use the `logging` module?** `print()` to stdout in Lambda writes the raw string to CloudWatch Logs. `logging` adds a prefix (`INFO:root:...`) that breaks JSON parsing. For structured JSON, `print` is correct.
 
-### Why `Attr('archived').not_exists()` is needed
-
-DynamoDB evaluates a missing attribute as NULL. `NULL ≠ true` returns **false** — not true — so `ne(True)` alone silently skips every note that predates Stage 7. The explicit `not_exists()` condition catches those notes correctly.
+**Why re-raise after logging in the worker?** If we catch and swallow the exception, SQS deletes the message — no retry, no DLQ. Re-raising means SQS retries up to `maxReceiveCount`, then moves the message to the DLQ, which triggers the DLQ alarm.
 
 ---
 
 ## AWS Deployment
 
 ### Prerequisites
-
-- Existing setup from Stages 1–6
+- Existing setup from Stages 1–7
 - AWS CLI configured
 
 ---
 
-### Step 1 — IAM Role for the Maintenance Lambda
+### Step 1 — Redeploy All Three Lambdas
 
 ```bash
-aws iam create-role \
-  --role-name tiny-notes-maintenance-role \
-  --assume-role-policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [{
-      "Effect": "Allow",
-      "Principal": {"Service": "lambda.amazonaws.com"},
-      "Action": "sts:AssumeRole"
-    }]
-  }'
+cd lambda
 
-# CloudWatch Logs
-aws iam attach-role-policy \
-  --role-name tiny-notes-maintenance-role \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+zip api.zip         handler.py    && aws lambda update-function-code \
+  --function-name tiny-notes            --zip-file fileb://api.zip
 
-# DynamoDB — Scan to find old notes, UpdateItem to archive them
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+zip worker.zip      worker.py     && aws lambda update-function-code \
+  --function-name tiny-notes-worker     --zip-file fileb://worker.zip
 
-aws iam put-role-policy \
-  --role-name tiny-notes-maintenance-role \
-  --policy-name TinyNotesMaintenanceDynamo \
-  --policy-document "{
-    \"Version\": \"2012-10-17\",
-    \"Statement\": [{
-      \"Effect\": \"Allow\",
-      \"Action\": [\"dynamodb:Scan\", \"dynamodb:UpdateItem\"],
-      \"Resource\": \"arn:aws:dynamodb:us-east-1:${ACCOUNT_ID}:table/tiny-notes\"
-    }]
-  }"
+zip maintenance.zip maintenance.py && aws lambda update-function-code \
+  --function-name tiny-notes-maintenance --zip-file fileb://maintenance.zip
+
+cd ..
 ```
 
 ---
 
-### Step 2 — Create the Maintenance Lambda
+### Step 2 — Create an SNS Alert Topic
+
+All alarms send to one SNS topic. Subscribe your email to receive notifications.
 
 ```bash
-MAINT_ROLE_ARN=$(aws iam get-role \
-  --role-name tiny-notes-maintenance-role \
-  --query 'Role.Arn' --output text)
+SNS_ARN=$(aws sns create-topic \
+  --name tiny-notes-alerts \
+  --query TopicArn --output text)
 
-cd lambda && zip maintenance.zip maintenance.py && cd ..
+aws sns subscribe \
+  --topic-arn $SNS_ARN \
+  --protocol email \
+  --notification-endpoint your@email.com
 
-aws lambda create-function \
-  --function-name tiny-notes-maintenance \
-  --runtime python3.12 \
-  --handler maintenance.handler \
-  --role $MAINT_ROLE_ARN \
-  --zip-file fileb://lambda/maintenance.zip \
-  --environment Variables={TABLE_NAME=tiny-notes,ARCHIVE_AFTER_DAYS=30} \
-  --timeout 60 \
-  --region us-east-1
+echo "SNS ARN: $SNS_ARN"
 ```
 
-> Timeout is 60 s to allow for large table scans. Adjust `ARCHIVE_AFTER_DAYS` without redeploying by updating the environment variable.
+> Check your inbox and confirm the subscription before alarms can deliver.
 
-**To redeploy after code changes:**
+---
+
+### Step 3 — CloudWatch Alarms
+
+**Why these four?** Each targets a distinct failure mode:
+
+| Alarm | What it catches |
+|-------|----------------|
+| DLQ not empty | SQS worker failed to process a note after 3 retries |
+| API Lambda errors | Unhandled exceptions in the request path (DynamoDB errors, auth failures) |
+| Worker Lambda errors | Processing failures that are being retried |
+| API Gateway 5xx | Infrastructure-level failures not caught inside Lambda |
 
 ```bash
-cd lambda && zip maintenance.zip maintenance.py && cd ..
-aws lambda update-function-code \
-  --function-name tiny-notes-maintenance \
-  --zip-file fileb://lambda/maintenance.zip
+# 1. Dead-letter queue depth — any unprocessable message is worth investigating
+aws cloudwatch put-metric-alarm \
+  --alarm-name tiny-notes-dlq-not-empty \
+  --namespace AWS/SQS \
+  --metric-name ApproximateNumberOfMessagesVisible \
+  --dimensions Name=QueueName,Value=tiny-notes-processing-dlq \
+  --statistic Maximum \
+  --period 60 \
+  --evaluation-periods 1 \
+  --threshold 0 \
+  --comparison-operator GreaterThanThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions $SNS_ARN
+
+# 2. API Lambda errors — ≥5 errors in a 5-minute window
+aws cloudwatch put-metric-alarm \
+  --alarm-name tiny-notes-api-lambda-errors \
+  --namespace AWS/Lambda \
+  --metric-name Errors \
+  --dimensions Name=FunctionName,Value=tiny-notes \
+  --statistic Sum \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 5 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions $SNS_ARN
+
+# 3. Worker Lambda errors — ≥3 errors in a 5-minute window
+aws cloudwatch put-metric-alarm \
+  --alarm-name tiny-notes-worker-errors \
+  --namespace AWS/Lambda \
+  --metric-name Errors \
+  --dimensions Name=FunctionName,Value=tiny-notes-worker \
+  --statistic Sum \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 3 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions $SNS_ARN
+
+# 4. API Gateway 5xx — ≥10 server errors in a 5-minute window
+aws cloudwatch put-metric-alarm \
+  --alarm-name tiny-notes-api-5xx \
+  --namespace AWS/ApiGateway \
+  --metric-name 5XXError \
+  --dimensions Name=ApiName,Value=tiny-notes-api \
+  --statistic Sum \
+  --period 300 \
+  --evaluation-periods 1 \
+  --threshold 10 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --treat-missing-data notBreaching \
+  --alarm-actions $SNS_ARN
 ```
 
 ---
 
-### Step 3 — Create the EventBridge Scheduled Rule
+### Step 4 — CloudWatch Dashboard
 
 ```bash
-RULE_ARN=$(aws events put-rule \
-  --name tiny-notes-daily-maintenance \
-  --schedule-expression "cron(0 2 * * ? *)" \
-  --state ENABLED \
-  --query 'RuleArn' --output text)
-
-echo "Rule ARN: $RULE_ARN"
+aws cloudwatch put-dashboard \
+  --dashboard-name tiny-notes \
+  --dashboard-body '{
+  "widgets": [
+    {
+      "type": "metric", "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda Errors",
+        "region": "us-east-1",
+        "annotations": {},
+        "metrics": [
+          ["AWS/Lambda","Errors","FunctionName","tiny-notes",            {"label":"API"}],
+          ["AWS/Lambda","Errors","FunctionName","tiny-notes-worker",     {"label":"Worker"}],
+          ["AWS/Lambda","Errors","FunctionName","tiny-notes-maintenance", {"label":"Maintenance"}]
+        ],
+        "stat": "Sum", "period": 300, "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric", "width": 12, "height": 6,
+      "properties": {
+        "title": "API Gateway — Requests & Errors",
+        "region": "us-east-1",
+        "annotations": {},
+        "metrics": [
+          ["AWS/ApiGateway","Count",    "ApiName","tiny-notes-api",{"label":"Requests"}],
+          ["AWS/ApiGateway","5XXError", "ApiName","tiny-notes-api",{"label":"5xx","color":"#d62728"}],
+          ["AWS/ApiGateway","4XXError", "ApiName","tiny-notes-api",{"label":"4xx","color":"#ff7f0e"}]
+        ],
+        "stat": "Sum", "period": 60, "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric", "width": 12, "height": 6,
+      "properties": {
+        "title": "Dead-Letter Queue Depth",
+        "region": "us-east-1",
+        "annotations": {},
+        "metrics": [
+          ["AWS/SQS","ApproximateNumberOfMessagesVisible",
+           "QueueName","tiny-notes-processing-dlq",{"label":"DLQ messages","color":"#d62728"}]
+        ],
+        "stat": "Maximum", "period": 60, "view": "timeSeries"
+      }
+    },
+    {
+      "type": "metric", "width": 12, "height": 6,
+      "properties": {
+        "title": "Lambda Duration p90 (ms)",
+        "region": "us-east-1",
+        "annotations": {},
+        "metrics": [
+          ["AWS/Lambda","Duration","FunctionName","tiny-notes",        {"label":"API",    "stat":"p90"}],
+          ["AWS/Lambda","Duration","FunctionName","tiny-notes-worker", {"label":"Worker", "stat":"p90"}]
+        ],
+        "period": 300, "view": "timeSeries"
+      }
+    }
+  ]
+}'
 ```
 
-> `cron(0 2 * * ? *)` = 2:00 AM UTC every day. EventBridge cron has six fields — the `?` in position 6 (day-of-week) is required when position 4 (day-of-month) is `*`.
+Open the dashboard: **CloudWatch → Dashboards → tiny-notes**.
 
 ---
 
-### Step 4 — Grant EventBridge Permission to Invoke the Lambda
+### Step 5 — Log Metric Filter (Custom Metric)
+
+Turn the `note_created` log event into a CloudWatch metric so you can graph note creation rate and alarm on it:
 
 ```bash
-MAINT_ARN=$(aws lambda get-function \
-  --function-name tiny-notes-maintenance \
-  --query 'Configuration.FunctionArn' --output text)
-
-aws lambda add-permission \
-  --function-name tiny-notes-maintenance \
-  --statement-id eventbridge-daily \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com \
-  --source-arn $RULE_ARN
+aws logs put-metric-filter \
+  --log-group-name /aws/lambda/tiny-notes \
+  --filter-name NotesCreated \
+  --filter-pattern '{ $.action = "note_created" }' \
+  --metric-transformations \
+    metricName=NotesCreated,metricNamespace=TinyNotes,metricValue=1,defaultValue=0
 ```
+
+This creates `TinyNotes/NotesCreated` in CloudWatch Metrics. Add it to the dashboard or set an alarm like any other metric — no code change needed, no extra API call from Lambda.
 
 ---
 
-### Step 5 — Set the Lambda as the Rule Target
+## Log Insights Queries
 
-```bash
-aws events put-targets \
-  --rule tiny-notes-daily-maintenance \
-  --targets "Id=maintenance-lambda,Arn=${MAINT_ARN}"
+Open **CloudWatch → Log Insights**, select the log group, and run these:
+
+**All errors across the API Lambda:**
+```
+fields @timestamp, action, noteId, error
+| filter level = "ERROR" or level = "WARN"
+| sort @timestamp desc
+| limit 50
 ```
 
----
-
-### Step 6 — Test Without Waiting for the Schedule
-
-Invoke the Lambda immediately to verify it works before tomorrow:
-
-```bash
-aws lambda invoke \
-  --function-name tiny-notes-maintenance \
-  --payload '{}' \
-  --cli-binary-format raw-in-base64-out \
-  response.json
-
-cat response.json
-# {"archived": 2, "cutoff": "2026-03-25T..."}
+**Notes created per hour (last 24 h):**
+```
+fields @timestamp
+| filter action = "note_created"
+| stats count() as created by bin(1h)
+| sort @timestamp asc
 ```
 
-The response shows how many notes were archived and the cutoff timestamp used.
+**Slow Lambda invocations (built-in REPORT lines):**
+```
+filter @type = "REPORT"
+| stats avg(@duration), max(@duration), pct(@duration, 90) by bin(5m)
+```
 
-Note:
-
-- If you're testing locally, you may also change the CreatedAt value directly in the DynamoDB console to test the rule.
-- And change the EventBridge to run once per minute instead of once per day to test the Lambda without waiting for the scheduled time.
-
-### Step 7 — Upload Frontend and Invalidate Cache
-
-```bash
-aws s3 sync . s3://your-bucket-name \
-  --exclude "*" \
-  --include "index.html" \
-  --include "style.css" \
-  --include "app.js"
-
-aws cloudfront create-invalidation \
-  --distribution-id YOUR_DISTRIBUTION_ID \
-  --paths "/*"
+**Worker failures — which notes are stuck:**
+```
+fields @timestamp, noteId, error
+| filter action = "processing_failed"
+| sort @timestamp desc
 ```
 
 ---
@@ -204,22 +290,42 @@ aws cloudfront create-invalidation \
 
 ```mermaid
 flowchart LR
-    EB[EventBridge\ncron 0 2 * * ? *] -->|daily trigger| M[Maintenance Lambda\nmaintenance.py]
-    M -->|Scan old notes\nUpdateItem archived=true| DDB[(DynamoDB\ntiny-notes)]
-
     U[User Browser] -->|HTTPS| CF[CloudFront]
     CF --> S3W[S3 Static Site]
-    U -->|Bearer token| APIGW[API Gateway\n+ JWT Authorizer]
-    APIGW --> API[API Lambda\nhandler.py]
-    API --> DDB
+    U -->|Bearer token| APIGW[API Gateway]
+    APIGW --> API[API Lambda]
+    API --> DDB[(DynamoDB)]
     API -->|SendMessage| Q[SQS Queue]
     Q --> W[Worker Lambda]
     W --> DDB
+    Q -->|after 3 failures| DLQ[DLQ]
+    EB[EventBridge] --> M[Maintenance Lambda]
+    M --> DDB
     API <-->|presigned URLs| S3A[S3 Attachments]
+
+    API -->|JSON logs| CWL[CloudWatch Logs]
+    W   -->|JSON logs| CWL
+    M   -->|JSON logs| CWL
+    APIGW -->|metrics| CWM[CloudWatch Metrics]
+    Q     -->|metrics| CWM
+    DLQ   -->|metrics| CWM
+
+    CWL -->|metric filter\nNotesCreated| CWM
+    CWM -->|4 alarms| SNS[SNS Topic]
+    SNS -->|email| Dev[Developer]
 ```
 
 ---
 
-## What's Next — Stage 8
+## The Full 8-Stage Journey
 
-Add **CloudWatch** observability: structured logging, a dashboard, and alarms for Lambda errors, API 5xx responses, and DLQ message depth.
+| Stage | AWS Service | What it added |
+|-------|-------------|---------------|
+| 1 | S3 | Static site hosting |
+| 2 | CloudFront | CDN delivery + HTTPS |
+| 3 | API Gateway + Lambda + DynamoDB | Real backend, notes in the cloud |
+| 4 | Cognito | Auth, per-user data |
+| 5 | SQS + DLQ | Async processing, resilient queuing |
+| 6 | S3 presigned URLs | Direct browser-to-S3 file uploads |
+| 7 | EventBridge | Scheduled maintenance automation |
+| 8 | CloudWatch | Logs, metrics, alarms, dashboards |
