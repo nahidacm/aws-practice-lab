@@ -140,8 +140,11 @@ button:hover { background: #444; }
   flex-shrink: 0;
 }
 
-.badge.done    { background: #e6f4ea; color: #1e7e34; }
-.badge.pending { background: #fff3e0; color: #e65100; }
+.badge.done     { background: #e6f4ea; color: #1e7e34; }
+.badge.pending  { background: #fff3e0; color: #e65100; }
+.badge.archived { background: #f0f0f0; color: #999; }
+
+.note-text.is-archived { opacity: 0.45; text-decoration: line-through; }
 
 /* ── Attachments ─────────────────────────────────────────────────────────── */
 

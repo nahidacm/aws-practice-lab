@@ -70,11 +70,13 @@ function escapeHtml(str) {
 function renderNotes(notes) {
   list.innerHTML = '';
   notes.forEach(note => {
-    const { id, text, processedStatus, summary, attachmentKey, attachmentUrl } = note;
+    const { id, text, processedStatus, summary, attachmentKey, attachmentUrl, archived } = note;
 
     const badge = processedStatus === 'done'
       ? `<span class="badge done">${escapeHtml(summary || 'done')}</span>`
       : `<span class="badge pending">processing…</span>`;
+
+    const archivedTag = archived ? `<span class="badge archived">archived</span>` : '';
 
     const filename = attachmentKey ? attachmentKey.split('/').pop() : '';
     const attachment = attachmentKey
@@ -84,8 +86,9 @@ function renderNotes(notes) {
 
     const li = document.createElement('li');
     li.innerHTML = `
-      <span class="note-text">${escapeHtml(text)}</span>
+      <span class="note-text${archived ? ' is-archived' : ''}">${escapeHtml(text)}</span>
       ${badge}
+      ${archivedTag}
       ${attachment}
       <button class="delete-btn" data-id="${id}" aria-label="Delete note">✕</button>
     `;
